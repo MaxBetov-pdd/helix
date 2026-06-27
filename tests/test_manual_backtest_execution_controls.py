@@ -1,0 +1,300 @@
+"""Engine-level tests for the manual-backtest execution model.
+
+Covers the opt-in stops + position-sizing path added to
+``_run_directional_signal_series`` and asserts the legacy (no-controls) path is
+byte-identical, so the autonomous/paper pipeline is unaffected.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from helix.strategies.base import DirectionalSignals
+from helix.strategies import backtest as bt
+
+
+def _frame(closes, *, highs=None, lows=None, opens=None) -> pd.DataFrame:
+    n = len(closes)
+    idx = pd.date_range("2024-01-01", periods=n, freq="1h", tz="UTC")
+    opens = list(opens) if opens is not None else list(closes)
+    highs = list(highs) if highs is not None else [max(o, c) for o, c in zip(opens, closes)]
+    lows = list(lows) if lows is not None else [min(o, c) for o, c in zip(opens, closes)]
+    return pd.DataFrame(
+        {"open": opens, "high": highs, "low": lows, "close": closes, "volume": [1.0] * n},
+        index=idx,
+    )
+
+
+def _signals(df, entries, exits) -> DirectionalSignals:
+    s = DirectionalSignals.empty(df.index)
+    for i in entries:
+        s.long_entries.iloc[i] = True
+    for i in exits:
+        s.long_exits.iloc[i] = True
+    return s
+
+
+# ---------------------------------------------------------------------------
+# _normalize_execution_controls
+# ---------------------------------------------------------------------------
+
+def test_normalize_returns_none_when_nothing_active():
+    assert bt._normalize_execution_controls(None) is None
+    assert bt._normalize_execution_controls({}) is None
+    # Default sizing 'full' with no stops → legacy path.
+    assert bt._normalize_execution_controls({"sizing_mode": "full"}) is None
+    # Zero/blank stops are inactive.
+    assert bt._normalize_execution_controls({"stop_loss_pct": 0, "sizing_mode": ""}) is None
+
+
+def test_normalize_activates_on_any_control():
+    assert bt._normalize_execution_controls({"stop_loss_pct": 5}) is not None
+    assert bt._normalize_execution_controls({"sizing_mode": "fixed", "fixed_size": 1000}) is not None
+    assert bt._normalize_execution_controls({"time_stop_bars": 10}) is not None
+    assert bt._normalize_execution_controls({"sizing_mode": "atr"}) is not None  # atr implies a stop
+
+
+def test_normalize_coerces_and_clamps():
+    ec = bt._normalize_execution_controls(
+        {"sizing_mode": "KELLY", "kelly_lookback": "50", "time_stop_bars": -3, "stop_loss_pct": "2.5"}
+    )
+    assert ec["sizing_mode"] == "kelly"
+    assert ec["kelly_lookback"] == 50
+    assert ec["time_stop_bars"] is None  # negative dropped
+    assert ec["stop_loss_pct"] == 2.5
+
+
+# ---------------------------------------------------------------------------
+# Legacy invariance: no controls → identical to the historical implementation
+# ---------------------------------------------------------------------------
+
+def test_legacy_path_unchanged_when_no_controls():
+    df = _frame([100, 101, 102, 103, 104, 103, 102, 101, 100, 99])
+    sig = _signals(df, entries=[1], exits=[5])
+    trades = bt._run_directional_signal_series(df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0)
+    assert len(trades) == 1
+    t = trades[0]
+    # Entry fills next bar open after signal[1] -> bar 2 open=102; exit signal[5] -> bar 6 open=102.
+    assert t["entry_price"] == pytest.approx(102.0)
+    assert t["exit_price"] == pytest.approx(102.0)
+    assert "size_fraction" not in t  # legacy trades carry no sizing field
+
+
+def test_legacy_and_full_sizing_match():
+    """sizing_mode='full' with no stops normalises to None → identical trades."""
+    df = _frame([100, 101, 103, 102, 104, 101, 100])
+    sig = _signals(df, entries=[1], exits=[4])
+    legacy = bt._run_directional_signal_series(df, sig, warmup=0, leverage=2.0, fee_bps=3.5, slippage_bps=2.0)
+    full = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=2.0, fee_bps=3.5, slippage_bps=2.0,
+        execution_controls={"sizing_mode": "full"},
+    )
+    assert [t["pnl_pct"] for t in legacy] == [t["pnl_pct"] for t in full]
+
+
+# ---------------------------------------------------------------------------
+# Stops actually fire
+# ---------------------------------------------------------------------------
+
+def test_stop_loss_triggers_before_signal_exit():
+    # Long entered at bar 2 open=100; bar 3 dips to low=94 (>5% down) -> SL hit.
+    df = _frame(
+        closes=[100, 100, 100, 95, 96, 97],
+        opens=[100, 100, 100, 99, 96, 97],
+        highs=[100, 100, 100, 99, 97, 98],
+        lows=[100, 100, 100, 94, 95, 96],
+    )
+    sig = _signals(df, entries=[1], exits=[])  # no signal exit at all
+    trades = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"stop_loss_pct": 5.0},
+    )
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "stop_loss"
+    # Stop level = 100 * (1 - 0.05) = 95; bar 3 low 94 <= 95, open 99 > 95 -> fill at 95.
+    assert trades[0]["exit_price"] == pytest.approx(95.0)
+
+
+def test_take_profit_triggers():
+    df = _frame(
+        closes=[100, 100, 100, 110, 109],
+        opens=[100, 100, 100, 101, 109],
+        highs=[100, 100, 100, 112, 110],
+        lows=[100, 100, 100, 101, 108],
+    )
+    sig = _signals(df, entries=[1], exits=[])
+    trades = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"take_profit_pct": 8.0},
+    )
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "take_profit"
+    assert trades[0]["exit_price"] == pytest.approx(108.0)  # 100 * 1.08
+
+
+def test_take_profit_fills_at_target_on_gap_through_long():
+    # Bar 3 gaps up THROUGH the 8% target (108): open 115. Must fill at 108, not 115.
+    df = _frame(
+        closes=[100, 100, 100, 110, 110, 110],
+        opens=[100, 100, 100, 115, 110, 110],
+        highs=[100, 100, 100, 116, 111, 111],
+        lows=[100, 100, 100, 114, 109, 109],
+    )
+    sig = _signals(df, entries=[1], exits=[])
+    trades = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"take_profit_pct": 8.0},
+    )
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "take_profit"
+    assert trades[0]["exit_price"] == pytest.approx(108.0)  # target, not the 115 gap open
+
+
+def test_take_profit_fills_at_target_on_gap_through_short():
+    # Short TP 8% -> target 92. Bar 3 gaps down through it (open 85). Fill at 92, not 85.
+    df = _frame(
+        closes=[100, 100, 100, 90, 90, 90],
+        opens=[100, 100, 100, 85, 90, 90],
+        highs=[100, 100, 100, 86, 91, 91],
+        lows=[100, 100, 100, 84, 89, 89],
+    )
+    s = DirectionalSignals.empty(df.index)
+    s.short_entries.iloc[1] = True
+    trades = bt._run_directional_signal_series(
+        df, s, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        trade_mode="short_only", execution_controls={"take_profit_pct": 8.0},
+    )
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "take_profit"
+    assert trades[0]["exit_price"] == pytest.approx(92.0)  # target, not the 85 gap open
+
+
+def test_time_stop_triggers():
+    df = _frame([100, 100, 101, 102, 103, 104, 105, 106])
+    sig = _signals(df, entries=[1], exits=[])  # entry at bar 2
+    trades = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"time_stop_bars": 3},
+    )
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "time_stop"
+    assert trades[0]["bars_held"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Position sizing scales pnl
+# ---------------------------------------------------------------------------
+
+def test_trailing_stop_exits_at_peak_pullback():
+    df = _frame(
+        closes=[100, 100, 100, 110, 118, 109],
+        opens=[100, 100, 100, 105, 112, 110],
+        highs=[100, 100, 100, 115, 120, 110],
+        lows=[100, 100, 100, 104, 110, 107],
+    )
+    sig = _signals(df, entries=[1], exits=[])
+    trades = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"trailing_stop_pct": 10.0},
+    )
+    assert len(trades) == 1
+    assert trades[0]["exit_reason"] == "trailing_stop"
+    assert trades[0]["exit_price"] == pytest.approx(108.0)  # peak 120 * 0.90
+
+
+def test_trailing_stop_has_no_intrabar_lookahead():
+    # Bar 4 makes a new high (130) AND dips to 116; the trailing stop must NOT
+    # trigger on that same bar — its peak only counts from the next bar. So the
+    # exit happens on bar 5 (bars_held == 3 from entry bar 2), not bar 4.
+    df = _frame(
+        closes=[100, 100, 100, 110, 128, 118],
+        opens=[100, 100, 100, 105, 120, 120],
+        highs=[100, 100, 100, 115, 130, 120],
+        lows=[100, 100, 100, 104, 116, 110],
+    )
+    sig = _signals(df, entries=[1], exits=[])
+    trades = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"trailing_stop_pct": 10.0},
+    )
+    assert len(trades) == 1
+    assert trades[0]["bars_held"] == 3  # exits bar 5, not bar 4 (would be 2 with lookahead)
+    assert trades[0]["exit_reason"] == "trailing_stop"
+    assert trades[0]["exit_price"] == pytest.approx(117.0)  # peak 130 * 0.90
+
+
+def test_atr_sizing_bounded_and_stops_fire():
+    closes = list(np.linspace(100, 125, 45)) + list(np.linspace(125, 85, 45))
+    df = _frame(closes)
+    sig = _signals(df, entries=list(range(20, 85, 9)), exits=[])
+    trades = bt._run_directional_signal_series(
+        df, sig, warmup=14, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"sizing_mode": "atr", "atr_stop_multiplier": 2.0, "risk_per_trade": 0.01},
+    )
+    assert trades
+    for t in trades:
+        assert 0.0 < t["size_fraction"] <= 1.0
+
+
+def test_kelly_sizing_bounded():
+    closes = []
+    for _ in range(8):
+        closes += list(np.linspace(100, 90, 15)) + list(np.linspace(90, 106, 15))
+    df = _frame(closes)
+    sig = _signals(df, entries=list(range(16, len(closes) - 6, 30)), exits=list(range(28, len(closes) - 2, 30)))
+    trades = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"sizing_mode": "kelly", "kelly_multiplier": 0.5, "kelly_lookback": 20},
+    )
+    assert trades
+    for t in trades:
+        assert 0.0 <= t["size_fraction"] <= 1.0
+
+
+def test_fixed_sizing_scales_pnl():
+    df = _frame([100, 100, 100, 110, 110])
+    sig = _signals(df, entries=[1], exits=[3])
+    full = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"sizing_mode": "full"},
+    )
+    sized = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"sizing_mode": "fixed", "fixed_size": 2500},
+        initial_capital=10000.0,
+    )
+    # fixed 2500/10000 = 0.25 of equity → quarter the pnl.
+    assert sized[0]["size_fraction"] == pytest.approx(0.25)
+    # full path normalises to legacy (no size_fraction field); compare raw pnl.
+    legacy = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+    )
+    assert sized[0]["pnl_pct"] == pytest.approx(legacy[0]["pnl_pct"] * 0.25, rel=1e-3)
+
+
+def test_fraction_risk_sizing_uses_stop_distance():
+    df = _frame([100, 100, 100, 110, 110])
+    sig = _signals(df, entries=[1], exits=[3])
+    sized = bt._run_directional_signal_series(
+        df, sig, warmup=0, leverage=1.0, fee_bps=0.0, slippage_bps=0.0,
+        execution_controls={"sizing_mode": "fraction", "risk_per_trade": 0.02, "stop_loss_pct": 5.0},
+    )
+    # size = risk/(stop_dist*lev) = 0.02 / (0.05 * 1) = 0.4
+    assert sized[0]["size_fraction"] == pytest.approx(0.4)
+
+
+def test_kelly_and_atr_helpers():
+    assert bt._kelly_fraction([], 100) == 0.0
+    assert bt._kelly_fraction([1.0, 1.0, 1.0], 100) == 0.0  # no losses → 0
+    f = bt._kelly_fraction([0.1, 0.1, -0.05, 0.1, -0.05], 100)
+    assert 0.0 < f <= 1.0
+    atr = bt._compute_atr_series(_frame([100, 102, 101, 105, 103]), period=3)
+    assert len(atr) == 5 and (atr >= 0).all()
+
+
+def test_clamp01():
+    assert bt._clamp01(1.5) == 1.0
+    assert bt._clamp01(-0.2) == 0.0
+    assert bt._clamp01(float("nan")) == 0.0
+    assert bt._clamp01(0.33) == pytest.approx(0.33)

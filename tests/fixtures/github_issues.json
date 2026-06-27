@@ -1,0 +1,20 @@
+[
+  {
+    "number": 123,
+    "title": "Strategy crashes on empty bar data",
+    "body": "When I run a pipeline with sparse data, zipline raises IndexError in the feed adapter. Can reproduce with this snippet...",
+    "state": "open"
+  },
+  {
+    "number": 118,
+    "title": "Add support for pandas 2.x",
+    "body": "Current pin blocks pandas>=2.0.",
+    "state": "closed"
+  },
+  {
+    "number": 99,
+    "title": "Documentation: mean reversion example",
+    "body": "Add a worked mean-reversion example to the cookbook section.",
+    "state": "open"
+  }
+]

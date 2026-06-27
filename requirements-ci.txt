@@ -1,0 +1,41 @@
+# CI and local quality-gate dependencies.
+beautifulsoup4>=4.12
+ccxt>=4.5.0
+chromadb>=0.5
+click>=8.0
+croniter>=2.0
+cryptography>=41.0
+discord.py>=2.3
+duckdb>=1.1.0
+eth-account>=0.13.0
+fastapi>=0.111.0
+feedparser>=6.0
+filelock>=3.13
+httpx>=0.25
+hyperliquid-python-sdk>=0.22.0
+mcp>=1.0
+numpy>=1.26
+pandas>=2.2
+psutil>=5.9
+pyarrow>=16.0.0
+PyJWT>=2.8
+pytest>=8.0
+python-multipart>=0.0.9
+PyYAML>=6.0
+requests>=2.31
+rich>=13.0
+ruff>=0.4
+scikit-learn>=1.5
+scipy>=1.11
+slowapi>=0.1.9
+trafilatura>=2.0
+# Pinned explicitly: dateparser (pulled in by trafilatura) needs tzlocal at
+# import time. The unpinned transitive resolution first DROPPED it, and the
+# latest release (tzlocal 5.4.2) installs but fails to import in CI — breaking
+# `pytest --collect-only`. Pin to the last known-good version (5.4, which the
+# last-green CI run used) so collection stays deterministic.
+tzlocal==5.4
+uvicorn>=0.30.0
+websockets>=13.0,<17
+yfinance>=0.2
+yt-dlp>=2025.1.0

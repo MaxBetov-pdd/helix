@@ -1,0 +1,188 @@
+# Internal planning docs (keep local, never push)
+FULL_SYSTEM_AUDIT_PROMPT.md
+SYSTEM_STRATEGY_RECOVERY_PLAN.md
+3DAY_HANDSOFF_CHECKLIST.md
+3DAY_PREFLIGHT_CHECKLIST.md
+*_bug_prioritization.md
+daily-brief-*.md
+regime_backup.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Environment
+.env
+.venv
+env/
+venv/
+
+# Data & databases
+data/
+.data/
+.helix/
+.chromadb/
+chromadb_data/
+chroma/
+chroma_db/
+chroma_data/
+!frontend/src/routes/data/
+!frontend/src/routes/data/+page.svelte
+*.duckdb
+*.duckdb.wal
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# Logs
+*.log
+/logs/
+/.helix_logs/
+
+# Tool-session droppings
+.superpowers/
+
+# Legacy repo-root strategy snapshot (engine loads only helix/strategies/)
+/strategies/
+
+# Secrets & credentials
+.helix_key
+.webhook_secret
+
+# Frontend build artifacts
+frontend/.svelte-kit/
+frontend/node_modules/
+node_modules/
+
+# Temp/debug files
+frontend/check_out.txt
+frontend/DASHBOARD_SPEC.md
+frontend/c*.txt
+.tmp.driveupload/
+.tmp/
+.tmp*
+.npm-cache/
+.pytest-local/
+tmp_pytest*/
+pytest-cache-files-*/
+codex_tmp/
+nul
+$null
+test-results/
+
+# Local workspace state
+.helix_home/
+~/
+.claude/settings.local.json
+.claude/settings.json
+.claude/launch.json
+
+# User-local strategy scratch
+custom/
+helix/strategies/custom/*
+!helix/strategies/custom/__init__.py
+
+# Root-level ad hoc scripts and exports
+_audit_*.py
+_audit_*.txt
+audit_out*.txt
+scanner_extract.txt
+scn_*.txt
+check_*.py
+get_task_output.py
+read_qr_tasks.py
+schema_check.py
+temp_*.py
+temp_*.txt
+h90_*.csv
+risk_audit_*.txt
+*_postmortem.txt
+
+# Root-level scratch artifacts (data dumps, request/response captures)
+/*.parquet
+/bt_request.json
+
+# Stray root-level strategy scratch — AI strategies belong in
+# helix/strategies/custom/ (already ignored). These patterns only match the
+# repo root so they never shadow real package modules.
+/S[0-9]*.py
+/s[0-9]*.py
+/*_strategy.py
+/correlation_regime.py
+/donchian_composite_s03098.py
+/hidden_divergence.py
+/rsi_momentum_ma_trend.py
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.bak
+
+# Local git worktrees
+.worktrees/
+.claude/worktrees/
+
+# OS
+.DS_Store
+Thumbs.db
+.archive/
+.aider*
+
+# runtime lock (not source)
+.claude/scheduled_tasks.lock
+
+# Root-level scratch/probe scripts (autonomous research harnesses write to cwd)
+/_*.py
+
+# Local research / sweep tooling + their outputs — NOT part of the app (2026-06-16).
+# Kept on disk, never on main; the feature work was committed separately.
+/*.jsonl
+/*.err
+/.mcp.json
+/altsweep.py
+/breakout_sweep.py
+/cci_nudge.py
+/diag_*.py
+/gate_*.py
+/make_deploy.py
+/make_spec.py
+/meanrev_*.py
+/mom*.py
+/monitor_slate.py
+/poll_robustness.py
+/rocsol.py
+/trend_*_sweep.py
+/update_params.py
+/verify_deploys.py
+
+# Internal moat / roadmap planning docs — never publish
+.opt_poll.json
+docs/EDGE_CONNECT_PLAN.md
+docs/EDGE_CUTLINE_MAP.md
+docs/PAYWALL_HANDOFF.md
+docs/V1_MOAT_PLAN.md
+docs/V1_MOAT_SLICE2_PLAN.md
+
+# Vite config build artifacts
+frontend/vite.config.ts.timestamp-*.mjs
+
+# Packaging build artifacts (embedded runtime, staging, installer output)
+packaging/cache/
+packaging/staging/
+packaging/dist/
+
+# Claude Code local scratch (workflow scripts, scheduled-task locks)
+.claude/
+
+# Local scratch data files
+btc_4h.csv

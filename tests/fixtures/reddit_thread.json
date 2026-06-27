@@ -1,0 +1,56 @@
+[
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t3",
+          "data": {
+            "title": "Mean reversion on stretched funding rates",
+            "selftext": "I've been running a mean-reversion strategy on BTC and ETH perps when funding crosses +0.03%. Entry on fade, exit on funding normalization. Backtested sharpe ~1.4 over 2 years. Questions welcome.",
+            "permalink": "/r/algotrading/comments/abc123/mean_reversion_funding_rates/",
+            "score": 145,
+            "subreddit": "algotrading"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "kind": "Listing",
+    "data": {
+      "children": [
+        {
+          "kind": "t1",
+          "data": {
+            "body": "Have you tried ADX filtering? Stops trending regimes from eating returns.",
+            "score": 42,
+            "replies": {
+              "kind": "Listing",
+              "data": {
+                "children": [
+                  {
+                    "kind": "t1",
+                    "data": {
+                      "body": "Yes, ADX<25 filter helped. Cut drawdown ~20%.",
+                      "score": 18,
+                      "replies": ""
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "kind": "t1",
+          "data": {
+            "body": "What's your position sizing? Fixed notional or vol-scaled?",
+            "score": 24,
+            "replies": ""
+          }
+        }
+      ]
+    }
+  }
+]

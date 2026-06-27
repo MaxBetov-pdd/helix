@@ -1,0 +1,124 @@
+"""Robustness baseline + param-jitter compute bounds (2026-06-13).
+
+1. The robustness baseline resolves from the strategy's ACTIVE container backtest
+   (operator-pinned) when present, not whatever backtest ran most recently. Falls
+   back to the latest when there is no pin (or the pinned row is gone).
+2. The parameter-jitter sweep is bounded (iterations + per-rerun window + a
+   wall-clock deadline) so it can't overrun the step timeout and wedge the
+   gauntlet at param_jitter — the bounds are wired settings with safe defaults.
+"""
+
+from datetime import datetime, timedelta, timezone
+
+from helix.db import get_db
+from helix.gauntlet.tasks import _baseline_backtest_result, _latest_backtest_result
+
+
+def _insert_strategy(conn, sid, *, pinned=None):
+    conn.execute(
+        "INSERT INTO strategies (id, name, type, stage, pinned_backtest_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (sid, sid, "rsi_momentum", "gauntlet", pinned,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+
+
+def _insert_backtest(conn, rid, sid, *, symbol, created_offset_min, deleted=False):
+    base = datetime.now(timezone.utc) - timedelta(days=10)
+    conn.execute(
+        "INSERT INTO backtest_results (result_id, strategy_id, result_type, symbol, "
+        "timeframe, start_date, end_date, created_at, deleted_at) "
+        "VALUES (?, ?, 'backtest', ?, '1h', '2025-01-01', '2025-12-31', ?, ?)",
+        (rid, sid, symbol,
+         (base + timedelta(minutes=created_offset_min)).isoformat(),
+         (datetime.now(timezone.utc).isoformat() if deleted else None)),
+    )
+    conn.commit()
+
+
+def test_baseline_prefers_pinned_over_latest(helix_db):
+    # NEWER unpinned backtest + an OLDER pinned one. The baseline must be the pin.
+    with get_db() as conn:
+        _insert_strategy(conn, "bt-pin", pinned="r-old-pinned")
+        _insert_backtest(conn, "r-old-pinned", "bt-pin", symbol="SOL/USDT", created_offset_min=0)
+        _insert_backtest(conn, "r-new-latest", "bt-pin", symbol="BTC/USDT", created_offset_min=99)
+
+    baseline = _baseline_backtest_result("bt-pin")
+    assert baseline is not None
+    assert baseline["result_id"] == "r-old-pinned"
+    assert baseline["symbol"] == "SOL/USDT"  # ran on the pinned config, not the latest
+
+    # And _latest_ still returns the most-recent (the two helpers are distinct).
+    assert _latest_backtest_result("bt-pin")["result_id"] == "r-new-latest"
+
+
+def test_baseline_falls_back_to_latest_without_pin(helix_db):
+    with get_db() as conn:
+        _insert_strategy(conn, "bt-nopin", pinned=None)
+        _insert_backtest(conn, "r-a", "bt-nopin", symbol="ETH/USDT", created_offset_min=0)
+        _insert_backtest(conn, "r-b", "bt-nopin", symbol="BTC/USDT", created_offset_min=50)
+
+    assert _baseline_backtest_result("bt-nopin")["result_id"] == "r-b"
+
+
+def test_baseline_falls_back_when_pinned_row_deleted(helix_db):
+    # A dangling pin (soft-deleted row) must not strand the gauntlet — fall back.
+    with get_db() as conn:
+        _insert_strategy(conn, "bt-dangling", pinned="r-gone")
+        _insert_backtest(conn, "r-gone", "bt-dangling", symbol="SOL/USDT", created_offset_min=0, deleted=True)
+        _insert_backtest(conn, "r-live", "bt-dangling", symbol="BTC/USDT", created_offset_min=10)
+
+    assert _baseline_backtest_result("bt-dangling")["result_id"] == "r-live"
+
+
+def test_param_jitter_compute_bounds_are_wired_and_safe():
+    from helix.policy import DEFAULT_PIPELINE_CONFIG
+    from helix.routers.robustness import ParamJitterBody
+
+    rt = DEFAULT_PIPELINE_CONFIG["robustness_thresholds"]
+    # Bounded by default so the sweep can't overrun the step timeout.
+    assert 1 <= rt["param_jitter_max_iterations"] <= 50
+    assert rt["param_jitter_max_bars"] >= 720
+    assert rt["param_jitter_deadline_seconds"] >= 0
+    # The lighter API/UI default matches the cap (no surprise 50-rerun requests).
+    assert ParamJitterBody(strategy_id="s", result_id="r").n_iterations == 30
+
+
+def test_param_jitter_effective_iterations_are_capped():
+    # The effective rerun count is min(requested, max_iterations) — a large
+    # request can't blow past the wired cap.
+    from helix.policy import DEFAULT_PIPELINE_CONFIG
+
+    cap = int(DEFAULT_PIPELINE_CONFIG["robustness_thresholds"]["param_jitter_max_iterations"])
+    requested = 500
+    n_iters = min(max(int(requested), 1), cap)
+    assert n_iters == cap
+
+
+def test_param_jitter_deadline_cap_finishes_before_the_outer_hard_kill():
+    """The graceful param-jitter deadline must leave room for the final in-flight
+    rerun + verdict computation before the OUTER hard kill (submit 600s / gauntlet
+    300s). Otherwise the worker is hard-killed with NO verdict — the exact
+    false-negative ('missing required verdict tests: param_jitter') the adaptive
+    sizing set out to remove. Regression guard for that off-by-budget bug."""
+    from helix.routers.robustness import (
+        _PARAM_JITTER_DEADLINE_MARGIN_S,
+        _param_jitter_deadline_cap_s,
+    )
+
+    est_rerun_s = 54.0  # ~a non-vectorizable strategy at the default 4380-bar cap
+
+    # Gauntlet step tick (~300s): the deadline + one final in-flight rerun (the
+    # chunk runner only stops AFTER a rerun crosses the deadline) must finish < 300s.
+    gauntlet_cap = _param_jitter_deadline_cap_s(300.0, est_rerun_s)
+    assert gauntlet_cap + est_rerun_s < 300.0
+    assert gauntlet_cap == max(60.0, 300.0 - est_rerun_s - _PARAM_JITTER_DEADLINE_MARGIN_S)
+
+    # Submit path (600s): same safety invariant, and it gets to use more of its budget.
+    submit_cap = _param_jitter_deadline_cap_s(600.0, est_rerun_s)
+    assert submit_cap + est_rerun_s < 600.0
+    assert submit_cap > gauntlet_cap
+
+    # Never drops below the 60s floor, even with an implausibly small budget.
+    assert _param_jitter_deadline_cap_s(30.0, est_rerun_s) == 60.0

@@ -1,0 +1,35 @@
+{
+  "kind": "Listing",
+  "data": {
+    "after": "t3_abc124",
+    "before": null,
+    "children": [
+      {
+        "kind": "t3",
+        "data": {
+          "permalink": "/r/algotrading/comments/abc123/mean_reversion_funding_rates/",
+          "title": "Mean reversion on stretched funding rates",
+          "subreddit": "algotrading",
+          "score": 145,
+          "num_comments": 32,
+          "created_utc": 1712345678.0,
+          "url": "https://reddit.com/r/algotrading/comments/abc123/...",
+          "selftext": ""
+        }
+      },
+      {
+        "kind": "t3",
+        "data": {
+          "permalink": "/r/algotrading/comments/def456/pairs_trading_crypto_majors/",
+          "title": "Pairs trading crypto majors: results after 6mo",
+          "subreddit": "algotrading",
+          "score": 89,
+          "num_comments": 21,
+          "created_utc": 1711234567.0,
+          "url": "https://reddit.com/r/algotrading/comments/def456/...",
+          "selftext": ""
+        }
+      }
+    ]
+  }
+}

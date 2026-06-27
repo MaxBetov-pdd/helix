@@ -1,0 +1,42 @@
+"""Helix MCP server.
+
+Exposes the AI Drop Zone HTTP API as Model Context Protocol tools so a
+Claude Desktop (or any MCP-compatible client) can drive the strategy
+generation + backtest loop directly — no copy-paste.
+
+Run with:
+    python -m helix.mcp_server
+
+The Helix backend must be running (the stdio server is a thin HTTP client of
+the local API). `command` must be the project's venv interpreter, and unless
+`helix` is pip-installed, PYTHONPATH must point at the repo root so
+`-m helix.mcp_server` resolves regardless of the client's working directory.
+
+Configuration via environment:
+    HELIX_API_URL        default http://127.0.0.1:8003
+    HELIX_API_KEY        sent as x-api-key (only needed if HELIX_AUTH_REQUIRED)
+    HELIX_OPERATOR_KEY   sent as x-operator-key (only needed if auth is on)
+    HELIX_MCP_TIMEOUT    HTTP timeout in seconds (default 60)
+
+Claude Desktop config snippet (~/Library/Application Support/Claude/
+claude_desktop_config.json or %APPDATA%/Claude/claude_desktop_config.json).
+Use the ABSOLUTE venv python path and set PYTHONPATH to the repo root; the API
+keys are optional (omit them unless auth is enabled):
+
+    {
+      "mcpServers": {
+        "helix": {
+          "command": "<repo>/.venv/Scripts/python.exe",
+          "args": ["-m", "helix.mcp_server"],
+          "env": {
+            "PYTHONPATH": "<repo>",
+            "HELIX_API_URL": "http://127.0.0.1:8003"
+          }
+        }
+      }
+    }
+"""
+
+from .server import build_server, main
+
+__all__ = ["build_server", "main"]

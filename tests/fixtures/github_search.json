@@ -1,0 +1,22 @@
+{
+  "total_count": 2,
+  "incomplete_results": false,
+  "items": [
+    {
+      "full_name": "quantopian/zipline",
+      "description": "Zipline, a Pythonic algorithmic trading library",
+      "stargazers_count": 18000,
+      "language": "Python",
+      "pushed_at": "2024-12-01T12:00:00Z",
+      "html_url": "https://github.com/quantopian/zipline"
+    },
+    {
+      "full_name": "hudson-and-thames/mlfinlab",
+      "description": "MlFinLab helps portfolio managers and traders who want to leverage the power of machine learning by providing reproducible, interpretable, and easy-to-use tools.",
+      "stargazers_count": 3800,
+      "language": "Python",
+      "pushed_at": "2025-01-15T12:00:00Z",
+      "html_url": "https://github.com/hudson-and-thames/mlfinlab"
+    }
+  ]
+}

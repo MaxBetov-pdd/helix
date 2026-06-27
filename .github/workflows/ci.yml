@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: No real-identity leakage in tracked files
+        run: |
+          # The project ships under the "Judder" pseudonym. Fail if the real
+          # owner's name/personal email or a developer home path slips in.
+          if git grep -nIE 'aaronjudson|botlesterjudson|aaron@helix|Judson|Users[/\\]+Aaron' \
+               -- . ':!.github/workflows/ci.yml'; then
+            echo "::error::Real-identity string found in a tracked file (see matches above)."
+            exit 1
+          fi
+          echo "OK: no real-identity leakage detected."
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          # Full history so a secret committed in any past commit is caught,
+          # not just the latest diff.
+          fetch-depth: 0
+
+      - name: Scan for committed secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: requirements-ci.txt
+
+      - name: Install backend dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-ci.txt
+
+      - name: Run Ruff
+        run: ruff check helix tests
+
+      - name: Collect backend tests
+        run: python -m pytest --collect-only -q
+
+      - name: Run backend release stability tests
+        run: |
+          python -m pytest -q \
+            tests/test_db_kv_bootstrap.py \
+            tests/test_bot_loop_resilience.py \
+            tests/test_bot_stale_recovery_loop.py \
+            tests/test_discord_owner_guard.py \
+            tests/test_notification_renderers.py \
+            tests/test_brain_router.py \
+            tests/test_lab_worker_service.py \
+            tests/test_url_ingest.py \
+            tests/test_url_ingest_research_enqueue.py \
+            tests/test_scheduler_background_jobs.py \
+            tests/test_gauntlet_legitimacy.py \
+            tests/test_robustness_router.py \
+            tests/test_pipeline_hardening.py::test_failed_walk_forward_verdict_is_fold_rescued_when_oos_folds_pass \
+            tests/test_pipeline_hardening.py::test_evaluate_promotion_accepts_persisted_validation_artifacts_for_paper \
+            tests/test_pipeline_hardening.py::test_evaluate_promotion_blocks_failed_required_verdict_tests_for_paper
+
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Run frontend unit tests
+        run: npm test
+
+      - name: Run Svelte checks
+        run: npm run check
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run frontend smoke test
+        run: npm run test:e2e

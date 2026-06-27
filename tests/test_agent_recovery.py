@@ -1,0 +1,485 @@
+"""Tests for agent task recovery and contextvars isolation."""
+
+import asyncio
+import sqlite3
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
+
+import httpx
+
+from helix.agents import runner
+from helix.agents.runner import (
+    _current_agent_id,
+    _recover_dangling_tasks,
+)
+from helix.db import (
+    get_db,
+    reap_long_running_agent_tasks,
+    recover_dangling_runtime_tasks,
+    recover_stale_running_tasks,
+)
+from helix.system_pause import set_system_mode
+
+
+class TestAgentTaskRecovery:
+    """Dangling tasks are marked failed on startup."""
+
+    def _ensure_agent(self, conn):
+        """Insert parent agent row if not present (FK constraint)."""
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
+            "VALUES ('quant-researcher', 'Quant Researcher', 'researcher', datetime('now'))"
+        )
+
+    def test_recovers_running_tasks(self, helix_db):
+        from helix.db import get_db
+
+        now = datetime.now(timezone.utc).isoformat()
+        with get_db() as conn:
+            self._ensure_agent(conn)
+            conn.execute(
+                "INSERT INTO agent_tasks (agent_id, type, title, description, status, created_at) "
+                "VALUES ('quant-researcher', 'research', 'Test task', 'desc', 'running', ?)",
+                (now,),
+            )
+
+        _recover_dangling_tasks()
+
+        with get_db() as conn:
+            row = conn.execute("SELECT status, error FROM agent_tasks LIMIT 1").fetchone()
+        assert row["status"] == "failed"
+        assert "crashed" in row["error"].lower() or "restarted" in row["error"].lower()
+
+    def test_no_op_when_no_dangling(self, helix_db):
+        # Should not raise
+        _recover_dangling_tasks()
+
+    def test_leaves_pending_tasks_alone(self, helix_db):
+        from helix.db import get_db
+
+        now = datetime.now(timezone.utc).isoformat()
+        with get_db() as conn:
+            self._ensure_agent(conn)
+            conn.execute(
+                "INSERT INTO agent_tasks (agent_id, type, title, description, status, created_at) "
+                "VALUES ('quant-researcher', 'research', 'Pending task', 'desc', 'pending', ?)",
+                (now,),
+            )
+
+        _recover_dangling_tasks()
+
+        with get_db() as conn:
+            row = conn.execute("SELECT status FROM agent_tasks LIMIT 1").fetchone()
+        assert row["status"] == "pending"
+
+    def test_recover_stale_running_tasks_fails_execution_trader_by_default(self, helix_db):
+        from helix.db import get_db
+
+        now = "2020-01-01T00:00:00+00:00"
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
+                "VALUES ('execution-trader', 'Execution Trader', 'executor', datetime('now'))"
+            )
+            conn.execute(
+                "INSERT INTO agent_tasks (agent_id, type, title, description, status, created_at, started_at) "
+                "VALUES ('execution-trader', 'execution', 'Exec task', 'desc', 'running', ?, ?)",
+                (now, now),
+            )
+
+        result = recover_stale_running_tasks(stale_minutes=1)
+
+        with get_db() as conn:
+            row = conn.execute("SELECT status FROM agent_tasks WHERE agent_id = 'execution-trader'").fetchone()
+        assert result["agent_failed"] == 1
+        assert row["status"] == "failed"
+
+    def test_reaper_uses_task_specific_timeout_window(self, helix_db):
+        from helix.db import get_db
+
+        now = datetime.now(timezone.utc)
+        research_started = (now - timedelta(minutes=20)).isoformat()
+        backtest_started = (now - timedelta(minutes=20)).isoformat()
+        with get_db() as conn:
+            self._ensure_agent(conn)
+            conn.execute(
+                "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
+                "VALUES ('simulation-agent', 'Simulation Agent', 'simulation', datetime('now'))"
+            )
+            conn.execute(
+                "INSERT INTO agent_tasks (agent_id, type, title, description, status, created_at, started_at) "
+                "VALUES ('quant-researcher', 'research', 'Research task', 'desc', 'running', ?, ?)",
+                (research_started, research_started),
+            )
+            conn.execute(
+                "INSERT INTO agent_tasks (agent_id, type, title, description, status, created_at, started_at) "
+                "VALUES ('simulation-agent', 'backtest', 'Backtest task', 'desc', 'running', ?, ?)",
+                (backtest_started, backtest_started),
+            )
+
+        reaped = reap_long_running_agent_tasks(timeout_minutes=31)
+
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT agent_id, type, status, error FROM agent_tasks ORDER BY id"
+            ).fetchall()
+
+        by_type = {(row["agent_id"], row["type"]): dict(row) for row in rows}
+        assert reaped == 1
+        assert by_type[("quant-researcher", "research")]["status"] == "failed"
+        assert "16 minutes" in str(by_type[("quant-researcher", "research")]["error"])
+        assert by_type[("simulation-agent", "backtest")]["status"] == "running"
+
+
+class TestContextVarIsolation:
+    """_current_agent_id uses ContextVar for thread/task safety."""
+
+    def test_is_context_var(self):
+        assert isinstance(_current_agent_id, ContextVar)
+
+    def test_default_is_none(self):
+        assert _current_agent_id.get() is None
+
+    def test_set_and_reset(self):
+        token = _current_agent_id.set("test-agent")
+        assert _current_agent_id.get() == "test-agent"
+        _current_agent_id.reset(token)
+        assert _current_agent_id.get() is None
+
+    def test_concurrent_tasks_isolated(self):
+        """Verify that concurrent async tasks have independent context."""
+        results = {}
+
+        async def agent_work(agent_id: str):
+            token = _current_agent_id.set(agent_id)
+            await asyncio.sleep(0.01)  # simulate work
+            results[agent_id] = _current_agent_id.get()
+            _current_agent_id.reset(token)
+
+        async def run():
+            await asyncio.gather(
+                agent_work("agent-a"),
+                agent_work("agent-b"),
+                agent_work("agent-c"),
+            )
+
+        asyncio.run(run())
+
+        assert results["agent-a"] == "agent-a"
+        assert results["agent-b"] == "agent-b"
+        assert results["agent-c"] == "agent-c"
+
+
+def test_transient_provider_failure_requeues_agent_task(helix_db, monkeypatch):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
+            "VALUES ('quant-researcher', 'Quant Researcher', 'researcher', datetime('now'))"
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_tasks
+                (agent_id, type, title, description, status, created_at, input_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "quant-researcher",
+                "research",
+                "Ideation: Generate Strategy Hypotheses",
+                "Test retry handling",
+                "pending",
+                now,
+                '{"_channel":"chat"}',
+            ),
+        )
+        task_row = conn.execute(
+            "SELECT * FROM agent_tasks WHERE agent_id = 'quant-researcher' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        task = dict(task_row)
+
+    async def _raise_timeout(*args, **kwargs):
+        raise httpx.ConnectTimeout("")
+
+    monkeypatch.setattr(runner, "_check_task_owner", lambda *args, **kwargs: (None, True))
+    monkeypatch.setattr(runner, "read_workspace", lambda *args, **kwargs: "")
+    monkeypatch.setattr(runner, "build_agent_context", lambda *args, **kwargs: "")
+    monkeypatch.setattr(runner, "_get_tools_for_agent", lambda *args, **kwargs: [])
+    monkeypatch.setattr(runner, "_call_with_tools", _raise_timeout)
+    monkeypatch.setattr(runner, "append_workspace", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner, "log_activity", lambda *args, **kwargs: None)
+
+    result = asyncio.run(
+        runner.run_agent_task(
+            {"id": "quant-researcher", "name": "Quant Researcher", "model": "openai", "model_id": "gpt-5.2"},
+            task,
+        )
+    )
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT status, error, retry_at, started_at, completed_at FROM agent_tasks WHERE id = ?",
+            (task["id"],),
+        ).fetchone()
+
+    assert result["error"] == "ConnectTimeout"
+    assert row["status"] == "pending"
+    assert "Provider unavailable; requeued for retry: ConnectTimeout" in str(row["error"])
+    assert row["retry_at"]
+    assert row["started_at"] is None
+    assert row["completed_at"] is None
+
+
+def test_requeue_agent_task_tolerates_locked_activity_log(helix_db, monkeypatch):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
+            "VALUES ('quant-researcher', 'Quant Researcher', 'researcher', datetime('now'))"
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_tasks
+                (agent_id, type, title, description, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "quant-researcher",
+                "research",
+                "Retry path survives locked activity log",
+                "Test retry-path resilience",
+                "running",
+                now,
+            ),
+        )
+        task_id = int(
+            conn.execute(
+                "SELECT id FROM agent_tasks WHERE agent_id = 'quant-researcher' ORDER BY id DESC LIMIT 1"
+            ).fetchone()["id"]
+        )
+
+    @contextmanager
+    def _locked_best_effort_db(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+        yield
+
+    monkeypatch.setattr("helix.db.get_db_best_effort", _locked_best_effort_db)
+
+    requeued = runner._requeue_agent_task(
+        task_id,
+        "quant-researcher",
+        "Retry path survives locked activity log",
+        "Provider unavailable; requeued for retry: ConnectTimeout",
+    )
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT status, retry_count, retry_at, started_at, completed_at FROM agent_tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        activity_count = int(
+            conn.execute("SELECT COUNT(*) AS c FROM activity_log").fetchone()["c"]
+        )
+
+    assert requeued is True
+    assert row["status"] == "pending"
+    assert int(row["retry_count"] or 0) == 1
+    assert row["retry_at"]
+    assert row["started_at"] is None
+    assert row["completed_at"] is None
+    assert activity_count == 0
+
+
+def test_kv_set_best_effort_tolerates_sqlite_lock(helix_db, monkeypatch):
+    from helix import db as db_mod
+
+    @contextmanager
+    def _locked_best_effort_db(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+        yield
+
+    monkeypatch.setattr(db_mod, "get_db_best_effort", _locked_best_effort_db)
+
+    assert db_mod.kv_set_best_effort("scheduler:last_progress_at", "now") is False
+
+
+def test_agent_task_timeout_requeues_non_execution_work(helix_db, monkeypatch):
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
+            "VALUES ('quant-researcher', 'Quant Researcher', 'researcher', datetime('now'))"
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_tasks
+                (agent_id, type, title, description, status, created_at, input_data)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "quant-researcher",
+                "research",
+                "Timeout resilience",
+                "Test task timeout retry handling",
+                "pending",
+                now,
+                '{"_channel":"chat"}',
+            ),
+        )
+        task_row = conn.execute(
+            "SELECT * FROM agent_tasks WHERE agent_id = 'quant-researcher' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        task = dict(task_row)
+
+    async def _sleepy_inner(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        return {"ok": True}
+
+    monkeypatch.setattr(runner, "_check_task_owner", lambda *args, **kwargs: (None, True))
+    monkeypatch.setattr(runner, "_run_agent_task_inner", _sleepy_inner)
+    monkeypatch.setattr(runner, "resolve_agent_task_timeout_seconds", lambda *args, **kwargs: 0.01)
+    monkeypatch.setattr(runner, "log_activity", lambda *args, **kwargs: None)
+
+    result = asyncio.run(
+        runner.run_agent_task(
+            {"id": "quant-researcher", "name": "Quant Researcher", "model": "openai", "model_id": "gpt-5.2"},
+            task,
+        )
+    )
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT status, error, retry_at, retry_count, started_at, completed_at FROM agent_tasks WHERE id = ?",
+            (task["id"],),
+        ).fetchone()
+
+    assert result["error"] == "AI/provider timeout after 0.01s"
+    assert row["status"] == "pending"
+    assert row["retry_count"] == 1
+    assert "AI/provider timeout after 0.01s" in str(row["error"])
+    assert row["retry_at"]
+    assert row["started_at"] is None
+    assert row["completed_at"] is None
+
+
+def test_recover_stale_running_tasks_requeues_transient_provider_failures(helix_db):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
+            "VALUES ('quant-researcher', 'Quant Researcher', 'researcher', datetime('now'))"
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_tasks
+                (agent_id, type, title, description, status, created_at, completed_at, error)
+            VALUES (?, ?, ?, ?, 'failed', ?, ?, ?)
+            """,
+            (
+                "quant-researcher",
+                "research",
+                "Recovered transient failure",
+                "desc",
+                old,
+                old,
+                "ConnectTimeout",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO tasks
+                (type, payload, status, created_at, completed_at, error)
+            VALUES (?, ?, 'failed', ?, ?, ?)
+            """,
+            (
+                "brain_invoke",
+                "{}",
+                old,
+                old,
+                "HTTPStatusError: Server error '500 Internal Server Error' for url 'https://api.minimax.io/anthropic/v1/messages'",
+            ),
+        )
+
+    recovered = recover_stale_running_tasks(stale_minutes=10)
+
+    with get_db() as conn:
+        agent_row = conn.execute(
+            "SELECT status, retry_at, completed_at, error FROM agent_tasks ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        brain_row = conn.execute(
+            "SELECT status, retry_at, completed_at, error FROM tasks WHERE type = 'brain_invoke' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert recovered["agent_requeued"] >= 1
+    assert recovered["brain_requeued"] >= 1
+    assert agent_row["status"] == "pending"
+    assert agent_row["retry_at"]
+    assert agent_row["completed_at"] is None
+    assert "Recovered after stale running task timeout" in str(agent_row["error"])
+    assert brain_row["status"] == "pending"
+    assert brain_row["retry_at"]
+    assert brain_row["completed_at"] is None
+    assert "Recovered after stale running task timeout" in str(brain_row["error"])
+
+
+def test_recover_stale_running_tasks_requeues_one_failed_duplicate_per_strategy(helix_db):
+    old = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
+    with get_db() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO agents (id, name, role, created_at) "
+            "VALUES ('simulation-agent', 'Simulation Agent', 'simulation', datetime('now'))"
+        )
+        for title in ("Older duplicate", "Newer duplicate"):
+            conn.execute(
+                """
+                INSERT INTO agent_tasks
+                    (agent_id, type, title, description, status, strategy_id, created_at, completed_at, error)
+                VALUES (?, ?, ?, ?, 'failed', ?, ?, ?, ?)
+                """,
+                (
+                    "simulation-agent",
+                    "backtest",
+                    title,
+                    "desc",
+                    "S-DUP",
+                    old,
+                    old,
+                    "Provider unavailable; ConnectTimeout",
+                ),
+            )
+
+    recovered = recover_stale_running_tasks(stale_minutes=10)
+
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT status FROM agent_tasks WHERE strategy_id = 'S-DUP' AND type = 'backtest' ORDER BY id"
+        ).fetchall()
+
+    assert recovered["agent_requeued"] == 1
+    assert [row["status"] for row in rows].count("pending") == 1
+    assert [row["status"] for row in rows].count("failed") == 1
+
+
+def test_recover_dangling_runtime_tasks_requeues_brain_and_respects_manual_mode(helix_db):
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO tasks (type, payload, status, source, claimed_at)
+            VALUES ('brain_invoke', '{}', 'running', 'system', datetime('now'))
+            """
+        )
+
+    set_system_mode("manual")
+    recovered = recover_dangling_runtime_tasks()
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT status, claimed_at, completed_at, error FROM tasks WHERE type = 'brain_invoke' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    assert recovered["brain_requeued"] == 1
+    assert row["status"] == "paused_manual"
+    assert row["claimed_at"] is None
+    assert row["completed_at"] is None
+    assert "process restarted" in str(row["error"]).lower()

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Quantocracy</title>
+  <link href="https://quantocracy.com/"/>
+  <updated>2025-03-10T12:00:00Z</updated>
+  <entry>
+    <title>A Quantitative Strategy Built on Gap Statistics</title>
+    <link href="https://quantocracy.com/gap-strategy"/>
+    <id>tag:quantocracy.com,2025:gap-strategy</id>
+    <updated>2025-03-10T12:00:00Z</updated>
+    <summary>Backtesting a gap-mean-reversion strategy on SPX index components.</summary>
+  </entry>
+  <entry>
+    <title>Regime Detection with Hidden Markov Models</title>
+    <link href="https://quantocracy.com/hmm-regime"/>
+    <id>tag:quantocracy.com,2025:hmm-regime</id>
+    <updated>2025-03-05T12:00:00Z</updated>
+    <summary>Detecting market regimes with HMM for strategy selection.</summary>
+  </entry>
+</feed>

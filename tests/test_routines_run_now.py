@@ -1,0 +1,132 @@
+"""Routine "Run now" — manual dispatch of a routine's brain_invoke job.
+
+Covers ``helix.control_plane.routines.dispatch_routine_now`` and the
+``POST /api/routines/{id}/run`` route. The manual dispatch must enqueue a
+``brain_invoke`` task using the SAME payload shape the scheduler builds for
+cron fires (prompt + tools_context + skills), differing only by ``source``.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+from helix.control_plane import routines as r
+from helix.db import get_db, init_db
+from helix.routers import routines as routines_router
+
+
+def _make(**overrides) -> int:
+    base = dict(
+        name="daily-roundup",
+        prompt="summarize the day",
+        cron_expr="0 17 * * *",
+        tools_context="research",
+        skills=["recall", "post_mortem"],
+    )
+    base.update(overrides)
+    return r.create_routine(**base)
+
+
+def _latest_brain_invoke_task() -> dict:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, type, payload, status FROM tasks "
+            "WHERE type = 'brain_invoke' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    assert row is not None, "no brain_invoke task was enqueued"
+    out = dict(row)
+    out["payload"] = json.loads(out["payload"] or "{}")
+    return out
+
+
+@pytest.fixture
+def client(helix_db) -> TestClient:
+    app = FastAPI()
+    app.include_router(routines_router.router)
+    return TestClient(app)
+
+
+# --- control-plane dispatch ----------------------------------------------
+
+def test_dispatch_enqueues_brain_invoke_task(helix_db) -> None:
+    init_db()
+    routine_id = _make()
+
+    result = r.dispatch_routine_now(routine_id)
+
+    assert result["task_id"] > 0
+    assert result["routine_id"] == routine_id
+    assert result["display_id"].startswith("T")
+
+    task = _latest_brain_invoke_task()
+    assert task["id"] == result["task_id"]
+    assert task["type"] == "brain_invoke"
+
+    payload = task["payload"]
+    # Reuses the scheduler's cron-fire payload shape, manual source.
+    assert payload["source"] == "manual_routine"
+    assert payload["routine_id"] == routine_id
+    assert payload["message"] == "summarize the day"
+    assert payload["tools_context"] == "research"
+    assert payload["skills"] == ["recall", "post_mortem"]
+
+
+def test_dispatch_records_run(helix_db) -> None:
+    init_db()
+    routine_id = _make()
+
+    r.dispatch_routine_now(routine_id)
+
+    routine = r.get_routine(routine_id)
+    assert routine is not None
+    assert routine["last_status"] == "dispatched"
+    assert routine["last_run_at"]
+
+
+def test_dispatch_missing_routine_raises(helix_db) -> None:
+    init_db()
+    with pytest.raises(r.RoutineValidationError):
+        r.dispatch_routine_now(999999)
+
+
+def test_dispatch_paused_routine_raises(helix_db) -> None:
+    init_db()
+    routine_id = _make(enabled=False)
+    with pytest.raises(r.RoutineDispatchError):
+        r.dispatch_routine_now(routine_id)
+
+
+# --- HTTP route -----------------------------------------------------------
+
+def test_run_route_dispatches_job(client: TestClient) -> None:
+    init_db()
+    routine_id = _make()
+
+    resp = client.post(f"/api/routines/{routine_id}/run")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["routine_id"] == routine_id
+    assert body["task_id"] > 0
+    assert body["display_id"].startswith("T")
+
+    task = _latest_brain_invoke_task()
+    assert task["id"] == body["task_id"]
+    assert task["payload"]["source"] == "manual_routine"
+    assert task["payload"]["message"] == "summarize the day"
+
+
+def test_run_route_missing_routine_returns_404(client: TestClient) -> None:
+    init_db()
+    resp = client.post("/api/routines/999999/run")
+    assert resp.status_code == 404
+
+
+def test_run_route_paused_routine_returns_409(client: TestClient) -> None:
+    init_db()
+    routine_id = _make(enabled=False)
+    resp = client.post(f"/api/routines/{routine_id}/run")
+    assert resp.status_code == 409

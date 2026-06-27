@@ -1,0 +1,23 @@
+﻿# Code of Conduct
+
+Helix's community spaces (GitHub issues, Discord, Reddit) are meant to be
+welcoming, respectful, and harassment-free for everyone, regardless of
+background or experience level.
+
+We ask all participants to:
+
+- Be respectful and constructive; assume good faith.
+- Focus on the ideas and the work, not the person.
+- Accept feedback graciously and give it kindly.
+- Keep discussion on-topic and free of personal attacks or harassment.
+
+This project adopts the **Contributor Covenant** as its standard of behavior.
+The full text is available at
+<https://www.contributor-covenant.org/version/2/1/code_of_conduct/>.
+
+## Reporting
+
+If you experience or witness unacceptable behavior, please contact the maintainer
+privately at **MaxBetov-pdd@helix.app**, or reach out via the
+[Discord](https://discord.gg/vzSQTneq6a) moderators. Reports will be handled
+confidentially and in good faith.

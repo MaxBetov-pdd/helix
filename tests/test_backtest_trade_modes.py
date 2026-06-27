@@ -1,0 +1,240 @@
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pandas as pd
+
+from helix.db import get_db
+from helix.strategies import backtest as backtest_mod
+from helix.strategies.base import BaseStrategy, DirectionalSignals, Signal
+
+
+def _price_frame() -> pd.DataFrame:
+    timestamps = pd.date_range("2026-01-01T00:00:00Z", periods=260, freq="h", tz="UTC")
+    closes = [100.0] * 210
+    closes.extend([101.0 + idx for idx in range(11)])  # long-friendly move
+    closes.extend([110.0 - idx for idx in range(39)])  # short-friendly move
+    frame = pd.DataFrame(
+        {
+            "timestamp": timestamps,
+            "open": closes,
+            "high": [value + 0.5 for value in closes],
+            "low": [value - 0.5 for value in closes],
+            "close": closes,
+            "volume": [1_000.0] * len(closes),
+        }
+    )
+    frame = frame.set_index("timestamp", drop=False)
+    return frame
+
+
+class _MirrorShortStrategy(BaseStrategy):
+    @property
+    def name(self) -> str:
+        return "Mirror Short"
+
+    @property
+    def asset(self) -> str:
+        return "BTC"
+
+    @property
+    def strategy_type(self) -> str:
+        return "mirror_short_dummy"
+
+    @property
+    def default_params(self) -> dict:
+        return {}
+
+    @property
+    def mirror_short_safe(self) -> bool:
+        return True
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        return Signal(price=float(df["close"].iloc[-1]), direction="long")
+
+    def generate_signals(self, df: pd.DataFrame):
+        entries = pd.Series(False, index=df.index, dtype=bool)
+        exits = pd.Series(False, index=df.index, dtype=bool)
+        if len(df) > 230:
+            entries.iloc[221] = True
+            exits.iloc[230] = True
+        return entries, exits
+
+
+class _BothSidesStrategy(BaseStrategy):
+    @property
+    def name(self) -> str:
+        return "Both Sides"
+
+    @property
+    def asset(self) -> str:
+        return "BTC"
+
+    @property
+    def strategy_type(self) -> str:
+        return "both_dummy"
+
+    @property
+    def default_params(self) -> dict:
+        return {}
+
+    @property
+    def supported_trade_modes(self) -> set[str]:
+        return {"long_only", "both"}
+
+    def generate_signal(self, df: pd.DataFrame) -> Signal:
+        return Signal(price=float(df["close"].iloc[-1]), direction="long")
+
+    def generate_signals(self, df: pd.DataFrame) -> DirectionalSignals:
+        signals = DirectionalSignals.empty(df.index)
+        if len(df) > 230:
+            signals.long_entries.iloc[210] = True
+            signals.long_exits.iloc[220] = True
+            signals.short_entries.iloc[221] = True
+            signals.short_exits.iloc[230] = True
+        return signals
+
+
+def _patch_backtest_environment(monkeypatch):
+    monkeypatch.setattr(backtest_mod, "_should_use_process_isolation", lambda: False)
+    monkeypatch.setattr(backtest_mod, "_sync_strategy_metrics_and_promote_if_eligible", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(backtest_mod, "_run_remote_backtest", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        backtest_mod,
+        "_validate_backtest_execution_parity",
+        lambda strategy_type, params, **_kwargs: (dict(params or {}), None, None),
+    )
+    monkeypatch.setattr(
+        backtest_mod,
+        "canonicalize_params",
+        lambda _strategy_type, params: SimpleNamespace(params=dict(params or {})),
+    )
+
+
+def test_backtest_strategy_supports_mirrored_short_only(helix_db, monkeypatch):
+    _patch_backtest_environment(monkeypatch)
+    monkeypatch.setattr(
+        backtest_mod,
+        "_resolve_strategy_class",
+        lambda strategy_type: _MirrorShortStrategy if strategy_type == "mirror_short_dummy" else None,
+    )
+
+    result = backtest_mod.backtest_strategy(
+        strategy_id="S-SHORT",
+        asset="BTC/USDT",
+        strategy_type="mirror_short_dummy",
+        params={},
+        bars=260,
+        candles_df=_price_frame(),
+        trade_mode="short_only",
+        persist_legacy_run=False,
+    )
+
+    assert not result.get("error")
+    assert result["trade_mode"] == "short_only"
+    assert result["position_model"] == "single_side"
+    assert result["metrics"]["trade_mode"] == "short_only"
+    assert result["metrics"]["by_side"]["short"]["total_trades"] >= 1
+    assert {trade["direction"] for trade in result["trades"]} == {"short"}
+    assert result["trades"][0]["pnl_pct"] > 0
+
+
+def test_backtest_strategy_supports_both_side_directional_signals(helix_db, monkeypatch):
+    _patch_backtest_environment(monkeypatch)
+    monkeypatch.setattr(
+        backtest_mod,
+        "_resolve_strategy_class",
+        lambda strategy_type: _BothSidesStrategy if strategy_type == "both_dummy" else None,
+    )
+
+    result = backtest_mod.backtest_strategy(
+        strategy_id="S-BOTH",
+        asset="BTC/USDT",
+        strategy_type="both_dummy",
+        params={},
+        bars=260,
+        candles_df=_price_frame(),
+        trade_mode="both",
+        persist_legacy_run=False,
+    )
+
+    assert not result.get("error")
+    assert result["trade_mode"] == "both"
+    assert result["position_model"] == "hedged"
+    assert result["metrics"]["trade_mode"] == "both"
+    assert result["metrics"]["by_side"]["long"]["total_trades"] >= 1
+    assert result["metrics"]["by_side"]["short"]["total_trades"] >= 1
+    assert {trade["direction"] for trade in result["trades"]} == {"long", "short"}
+
+
+def test_backtest_strategy_persists_full_config_for_legacy_history_rows(helix_db, monkeypatch):
+    _patch_backtest_environment(monkeypatch)
+    monkeypatch.setattr(
+        backtest_mod,
+        "_resolve_strategy_class",
+        lambda strategy_type: _BothSidesStrategy if strategy_type == "both_dummy" else None,
+    )
+
+    with get_db() as conn:
+        conn.execute(
+            """
+            INSERT INTO strategies
+            (id, name, type, symbol, timeframe, params, metrics, status, owner, stage)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "S-HISTORY",
+                "History Strategy",
+                "both_dummy",
+                "BTC/USDT",
+                "1h",
+                "{}",
+                "{}",
+                "quick_screen",
+                "test",
+                "quick_screen",
+            ),
+        )
+
+    result = backtest_mod.backtest_strategy(
+        strategy_id="S-HISTORY",
+        asset="BTC/USDT",
+        strategy_type="both_dummy",
+        params={"custom_threshold": 7, "timeframe": "1h"},
+        bars=260,
+        candles_df=_price_frame(),
+        trade_mode="both",
+        persist_legacy_run=True,
+    )
+
+    run_id = str(result.get("run_id") or "").strip()
+    assert run_id.startswith("B")
+
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT start_date, end_date, config_json FROM backtest_results WHERE result_id = ?",
+            (run_id,),
+        ).fetchone()
+
+    assert row is not None
+    assert str(row["start_date"] or "").strip()
+    assert str(row["end_date"] or "").strip()
+
+    config = json.loads(row["config_json"] or "{}")
+    assert config.get("params", {}).get("custom_threshold") == 7
+    assert config.get("trade_mode") == "both"
+    assert config.get("position_model") == "hedged"
+
+
+def test_resolve_backtest_trade_mode_falls_back_to_short_only_for_mirror_safe_strategy():
+    resolved_mode, error = backtest_mod.resolve_backtest_trade_mode(
+        None,
+        allow_shorting=True,
+        strategy_type="mirror_short_dummy",
+        params={},
+        strategy_obj=_MirrorShortStrategy("S-MIRROR", {}),
+    )
+
+    assert error is None
+    assert resolved_mode == "short_only"

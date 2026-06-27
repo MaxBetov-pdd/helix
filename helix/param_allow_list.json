@@ -1,0 +1,18 @@
+{
+  "allowed": {
+    "lookback_period": {"min": 7, "max": 200, "type": "int"},
+    "adx_min": {"min": 0, "max": 50, "type": "float"},
+    "adx_max": {"min": 10, "max": 100, "type": "float"},
+    "stop_loss_pct": {"min": 0.5, "max": 5.0, "type": "float"},
+    "rsi_threshold": {"min": 20, "max": 80, "type": "float"},
+    "volume_multiplier": {"min": 0.5, "max": 3.0, "type": "float"}
+  },
+  "denied": [
+    "leverage",
+    "position_size_pct",
+    "max_open_trades",
+    "risk_per_trade",
+    "risk_pct",
+    "risk_multiplier"
+  ]
+}

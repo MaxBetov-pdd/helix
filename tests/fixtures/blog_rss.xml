@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>QuantStart Articles</title>
+    <link>https://www.quantstart.com/</link>
+    <description>Quantitative finance articles</description>
+    <item>
+      <title>Mean Reversion Trading Strategies in Python</title>
+      <link>https://www.quantstart.com/articles/mean-reversion</link>
+      <description>An introduction to mean reversion strategies using Python and pandas. Covers funding rates, statistical tests, and backtesting.</description>
+      <pubDate>Mon, 10 Mar 2025 12:00:00 GMT</pubDate>
+      <guid>https://www.quantstart.com/articles/mean-reversion</guid>
+    </item>
+    <item>
+      <title>Building a Momentum Portfolio Using Factor Models</title>
+      <link>https://www.quantstart.com/articles/momentum</link>
+      <description>Factor-based momentum investing with cross-sectional rebalancing.</description>
+      <pubDate>Mon, 03 Mar 2025 12:00:00 GMT</pubDate>
+      <guid>https://www.quantstart.com/articles/momentum</guid>
+    </item>
+    <item>
+      <title>Pairs Trading with Cointegration Tests</title>
+      <link>https://www.quantstart.com/articles/pairs</link>
+      <description>Engle-Granger and Johansen cointegration approaches for pairs trading crypto majors.</description>
+      <pubDate>Mon, 24 Feb 2025 12:00:00 GMT</pubDate>
+      <guid>https://www.quantstart.com/articles/pairs</guid>
+    </item>
+  </channel>
+</rss>
